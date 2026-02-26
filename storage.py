@@ -63,6 +63,15 @@ class Storage:
                     data TEXT NOT NULL
                 );
                 CREATE INDEX IF NOT EXISTS idx_ev_ts ON events(timestamp);
+
+                CREATE TABLE IF NOT EXISTS candle_history (
+                    timestamp REAL PRIMARY KEY,
+                    open REAL NOT NULL,
+                    high REAL NOT NULL,
+                    low REAL NOT NULL,
+                    close REAL NOT NULL,
+                    volume INTEGER NOT NULL
+                );
             """)
         logger.info("[Storage] SQLite initialized at %s", self.db_path)
 
@@ -163,13 +172,55 @@ class Storage:
             ).fetchone()
         return row[0] if row else 0
 
+    def save_candles(self, candles):
+        """Save historical candles to SQLite (bulk insert, skip duplicates)."""
+        if not candles:
+            return
+        try:
+            with self._conn() as conn:
+                conn.executemany(
+                    "INSERT OR IGNORE INTO candle_history (timestamp, open, high, low, close, volume) VALUES (?, ?, ?, ?, ?, ?)",
+                    [(c["timestamp"], c["open"], c["high"], c["low"], c["close"], c["volume"]) for c in candles]
+                )
+            logger.info("[Storage] Saved %d candles", len(candles))
+        except Exception as e:
+            logger.error("[Storage] Error saving candles: %s", e)
+
+    def load_candles(self, days=5):
+        """Load candles from the last N days."""
+        cutoff = time.time() - days * 86400
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT timestamp, open, high, low, close, volume FROM candle_history WHERE timestamp >= ? ORDER BY timestamp",
+                (cutoff,)
+            ).fetchall()
+        return [
+            {"timestamp": r[0], "open": r[1], "high": r[2], "low": r[3], "close": r[4], "volume": r[5]}
+            for r in rows
+        ]
+
+    def has_candles_for_date(self, date_str):
+        """Check if we already have candles cached for a given date (YYYY-MM-DD)."""
+        from datetime import datetime
+        dt = datetime.strptime(date_str, "%Y-%m-%d")
+        start = dt.timestamp()
+        end = start + 86400
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) FROM candle_history WHERE timestamp >= ? AND timestamp < ?",
+                (start, end)
+            ).fetchone()
+        return row[0] > 0
+
     def cleanup(self, max_age_hours=24):
-        """Remove data older than max_age_hours."""
+        """Remove data older than max_age_hours. Candle history kept longer (7 days)."""
         cutoff = time.time() - max_age_hours * 3600
+        candle_cutoff = time.time() - 7 * 86400
         try:
             with self._conn() as conn:
                 for table in ["bookmap_frames", "tick_volumes", "delta_history", "events"]:
                     conn.execute(f"DELETE FROM {table} WHERE timestamp < ?", (cutoff,))
+                conn.execute("DELETE FROM candle_history WHERE timestamp < ?", (candle_cutoff,))
             logger.info("[Storage] Cleaned up data older than %dh", max_age_hours)
         except Exception as e:
             logger.error("[Storage] Cleanup error: %s", e)

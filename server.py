@@ -31,6 +31,7 @@ storage = Storage()
 clients: set[WebSocket] = set()
 depth_ws = DepthWebSocket()
 demo_mode = False
+cached_candles = []  # Historical candles loaded on startup
 
 
 async def broadcast(data: dict):
@@ -186,6 +187,62 @@ def restore_from_storage():
         logger.error("[Server] Restore error: %s", e)
 
 
+def fetch_and_cache_candles():
+    """Fetch 3+ days of historical candles from Dhan and cache in SQLite."""
+    global cached_candles
+
+    # First try loading from SQLite cache
+    cached_candles = storage.load_candles(days=5)
+    if cached_candles:
+        logger.info("[Server] Loaded %d cached candles from SQLite", len(cached_candles))
+
+    # Fetch fresh candles from Dhan API (5 calendar days ≈ 3 trading days)
+    try:
+        from dhan_client import fetch_historical_candles
+        fresh_candles = fetch_historical_candles(days=5, interval="5")
+        if fresh_candles:
+            storage.save_candles(fresh_candles)
+            # Reload from SQLite to get merged + deduplicated data
+            cached_candles = storage.load_candles(days=5)
+            logger.info("[Server] Fetched %d fresh candles, total cached: %d",
+                        len(fresh_candles), len(cached_candles))
+    except Exception as e:
+        logger.error("[Server] Error fetching historical candles: %s", e)
+        # Still use whatever we had cached
+
+
+def generate_demo_candles():
+    """Generate fake historical candles for demo mode."""
+    import random
+    import math
+
+    candles = []
+    base_price = 24500.0
+    t = time.time()
+
+    # Generate 3 days of 5-min candles (75 candles per day)
+    for day_offset in range(3, 0, -1):
+        day_start = t - day_offset * 86400
+        # Market hours: 9:15 to 15:30 = 375 min = 75 five-minute candles
+        for i in range(75):
+            candle_ts = day_start + 33300 + i * 300  # 33300 = 9:15 AM in seconds
+            drift = math.sin(candle_ts / 600) * 80 + math.sin(candle_ts / 3600) * 150
+            noise = random.uniform(-20, 20)
+            o = base_price + drift + noise
+            h = o + random.uniform(0, 30)
+            l = o - random.uniform(0, 30)
+            c = random.uniform(l, h)
+            v = random.randint(50000, 500000)
+            candles.append({
+                "timestamp": candle_ts,
+                "open": round(o, 2), "high": round(h, 2),
+                "low": round(l, 2), "close": round(c, 2),
+                "volume": v,
+            })
+
+    return candles
+
+
 @asynccontextmanager
 async def lifespan(app):
     """Start depth feed on server startup."""
@@ -194,12 +251,22 @@ async def lifespan(app):
     # Restore accumulated data from SQLite
     restore_from_storage()
 
+    # Fetch historical candles (blocking on startup is fine)
+    if DHAN_ACCESS_TOKEN:
+        await asyncio.to_thread(fetch_and_cache_candles)
+    else:
+        demo_mode = True
+        # Generate demo candles for demo mode
+        global cached_candles
+        cached_candles = generate_demo_candles()
+        storage.save_candles(cached_candles)
+        logger.info("[Server] Generated %d demo candles", len(cached_candles))
+
     # Start storage flush task
     flush_task = asyncio.create_task(storage_flush_loop())
     cleanup_task = asyncio.create_task(storage_cleanup_loop())
 
-    if not DHAN_ACCESS_TOKEN:
-        demo_mode = True
+    if demo_mode:
         logger.info("[Server] No DHAN_ACCESS_TOKEN — running in DEMO mode")
         feed_task = asyncio.create_task(demo_poll())
     else:
@@ -254,6 +321,7 @@ async def websocket_endpoint(ws: WebSocket):
         history = {
             "type": "history",
             "bookmap_frames": await asyncio.to_thread(storage.load_bookmap_frames, 3000),
+            "candles": cached_candles,
             "tick_volumes": await asyncio.to_thread(storage.load_tick_volumes, 2000),
             "delta_history": await asyncio.to_thread(storage.load_delta_history, 2000),
             "cumulative_delta": analytics.cumulative_delta,

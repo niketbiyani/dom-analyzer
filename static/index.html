@@ -561,10 +561,11 @@
             </div>
             <div class="bookmap-footer">
                 <div class="bookmap-legend">
-                    <div class="legend-item"><div class="legend-swatch" style="background:var(--green)"></div> Bids</div>
-                    <div class="legend-item"><div class="legend-swatch" style="background:var(--red)"></div> Asks</div>
+                    <div class="legend-item"><div class="legend-swatch" style="background:rgba(63,185,80,0.3);border:1px solid var(--green)"></div> Candle (up)</div>
+                    <div class="legend-item"><div class="legend-swatch" style="background:rgba(248,81,73,0.3);border:1px solid var(--red)"></div> Candle (down)</div>
+                    <div class="legend-item"><div class="legend-swatch" style="background:var(--green)"></div> Bid Depth</div>
+                    <div class="legend-item"><div class="legend-swatch" style="background:var(--red)"></div> Ask Depth</div>
                     <div class="legend-item"><div class="legend-swatch" style="background:var(--yellow)"></div> LTP</div>
-                    <div class="legend-item"><div class="legend-swatch" style="background:rgba(255,255,255,0.8)"></div> Wall</div>
                 </div>
                 <span id="bookmapInfo">Loading historical data...</span>
             </div>
@@ -651,6 +652,8 @@
         totalSell: 0,
         // Bookmap frames: [{ts, ltp, bids: [[p,q],...], asks: [[p,q],...]}]
         bookmapFrames: [],
+        // Historical candles: [{timestamp, open, high, low, close, volume}]
+        candles: [],
         historyLoaded: false,
     };
 
@@ -763,6 +766,11 @@
             if (state.deltaData.length > DELTA_MAX) {
                 state.deltaData = state.deltaData.slice(-DELTA_MAX);
             }
+        }
+
+        // Historical candles from Dhan API
+        if (data.candles && data.candles.length > 0) {
+            state.candles = data.candles;
         }
 
         state.historyLoaded = true;
@@ -1056,8 +1064,43 @@
     }
 
     // ============================================================
-    //  BOOKMAP — Scrolling Depth Heatmap
+    //  BOOKMAP — Unified Timeline: Historical Candles + Live Depth
     // ============================================================
+
+    /**
+     * Build a unified timeline of items to render on the bookmap.
+     * Each item is either a candle (historical) or a depth frame (live).
+     * Returns array of {ts, type, ...data} sorted by timestamp.
+     */
+    function buildBookmapTimeline() {
+        const items = [];
+
+        // Add candles as timeline items
+        for (const c of state.candles) {
+            items.push({
+                ts: c.timestamp,
+                type: 'candle',
+                open: c.open, high: c.high, low: c.low, close: c.close,
+                volume: c.volume,
+                ltp: c.close,
+            });
+        }
+
+        // Add live depth frames
+        for (const f of state.bookmapFrames) {
+            items.push({
+                ts: f.ts,
+                type: 'depth',
+                ltp: f.ltp,
+                bids: f.bids,
+                asks: f.asks,
+            });
+        }
+
+        // Sort by timestamp, deduplicate if candle and frame overlap
+        items.sort((a, b) => a.ts - b.ts);
+        return items;
+    }
 
     function drawBookmap() {
         const canvas = document.getElementById('bookmapChart');
@@ -1074,12 +1117,15 @@
         ctx.fillStyle = '#0d1117';
         ctx.fillRect(0, 0, W, H);
 
-        const frames = state.bookmapFrames;
-        if (frames.length < 2) {
+        const allItems = buildBookmapTimeline();
+        if (allItems.length < 2) {
             ctx.fillStyle = '#8b949e';
             ctx.font = '14px monospace';
             ctx.textAlign = 'center';
-            ctx.fillText('Waiting for bookmap data...', W / 2, H / 2);
+            ctx.fillText('Waiting for data...', W / 2, H / 2);
+            if (state.candles.length === 0 && state.bookmapFrames.length === 0) {
+                ctx.fillText('Historical candles will load on connect', W / 2, H / 2 + 20);
+            }
             return;
         }
 
@@ -1090,66 +1136,113 @@
         const chartW = W - padL - padR;
         const chartH = H - padT - padB;
 
-        // Determine visible frames: aim for ~2-3px per column
+        // Determine visible items: ~2-3px per column
         const maxVisible = Math.floor(chartW / 2);
-        const visibleFrames = frames.slice(-maxVisible);
-        const colW = chartW / visibleFrames.length;
+        const visible = allItems.slice(-maxVisible);
+        const colW = chartW / visible.length;
 
-        // Determine price range from visible frames
+        // Determine price range from all visible items
         let priceMin = Infinity, priceMax = -Infinity;
-        for (const f of visibleFrames) {
-            for (const [p, q] of f.bids) {
-                if (q > 0) { priceMin = Math.min(priceMin, p); priceMax = Math.max(priceMax, p); }
-            }
-            for (const [p, q] of f.asks) {
-                if (q > 0) { priceMin = Math.min(priceMin, p); priceMax = Math.max(priceMax, p); }
+        for (const item of visible) {
+            if (item.type === 'candle') {
+                priceMin = Math.min(priceMin, item.low);
+                priceMax = Math.max(priceMax, item.high);
+            } else {
+                for (const [p, q] of item.bids) {
+                    if (q > 0) { priceMin = Math.min(priceMin, p); priceMax = Math.max(priceMax, p); }
+                }
+                for (const [p, q] of item.asks) {
+                    if (q > 0) { priceMin = Math.min(priceMin, p); priceMax = Math.max(priceMax, p); }
+                }
             }
         }
 
         if (priceMin >= priceMax) return;
 
-        // Auto-detect tick size from bid levels
+        // Auto-detect tick size from depth frames
         let tickSize = 0.05;
-        const sampleFrame = visibleFrames[Math.floor(visibleFrames.length / 2)];
-        if (sampleFrame.bids.length >= 2) {
-            const sorted = [...sampleFrame.bids].sort((a, b) => b[0] - a[0]);
+        const depthFrame = visible.find(v => v.type === 'depth' && v.bids.length >= 2);
+        if (depthFrame) {
+            const sorted = [...depthFrame.bids].sort((a, b) => b[0] - a[0]);
             const detected = Math.abs(sorted[0][0] - sorted[1][0]);
             if (detected > 0.001) tickSize = detected;
         }
 
         // Pad range
-        priceMin = Math.floor(priceMin / tickSize) * tickSize - tickSize * 3;
-        priceMax = Math.ceil(priceMax / tickSize) * tickSize + tickSize * 3;
+        priceMin = Math.floor(priceMin / tickSize) * tickSize - tickSize * 5;
+        priceMax = Math.ceil(priceMax / tickSize) * tickSize + tickSize * 5;
         const priceRange = priceMax - priceMin;
         const numRows = Math.round(priceRange / tickSize) + 1;
         const rowH = chartH / numRows;
 
-        // Find quantity scale (95th percentile for good contrast)
+        // Helper: price → Y coordinate
+        const priceToY = (price) => padT + (priceMax - price) / tickSize * rowH;
+
+        // Find depth quantity scale (95th percentile)
         const allQtys = [];
-        for (const f of visibleFrames) {
-            for (const [, q] of f.bids) if (q > 0) allQtys.push(q);
-            for (const [, q] of f.asks) if (q > 0) allQtys.push(q);
+        for (const item of visible) {
+            if (item.type !== 'depth') continue;
+            for (const [, q] of item.bids) if (q > 0) allQtys.push(q);
+            for (const [, q] of item.asks) if (q > 0) allQtys.push(q);
         }
         allQtys.sort((a, b) => a - b);
-        const p95 = allQtys[Math.floor(allQtys.length * 0.95)] || 1;
-        const scaleMax = Math.max(p95, 1);
+        const scaleMax = Math.max(allQtys[Math.floor(allQtys.length * 0.95)] || 1, 1);
 
-        // --- Draw heatmap cells ---
-        for (let fi = 0; fi < visibleFrames.length; fi++) {
-            const f = visibleFrames[fi];
-            const x = padL + fi * colW;
+        // Find volume scale for candle volume bubbles
+        const allVols = visible.filter(v => v.type === 'candle').map(v => v.volume);
+        allVols.sort((a, b) => a - b);
+        const volMax = Math.max(allVols[Math.floor(allVols.length * 0.95)] || 1, 1);
+
+        // ===== PASS 1: Draw candle OHLC ranges (background) =====
+        for (let i = 0; i < visible.length; i++) {
+            const item = visible[i];
+            if (item.type !== 'candle') continue;
+            const x = padL + i * colW;
+            const isUp = item.close >= item.open;
+
+            // High-Low range (wick)
+            const highY = priceToY(item.high);
+            const lowY = priceToY(item.low);
+            ctx.fillStyle = isUp ? 'rgba(63, 185, 80, 0.12)' : 'rgba(248, 81, 73, 0.12)';
+            ctx.fillRect(x, highY, colW + 0.5, lowY - highY);
+
+            // Open-Close body (brighter)
+            const openY = priceToY(item.open);
+            const closeY = priceToY(item.close);
+            const bodyTop = Math.min(openY, closeY);
+            const bodyBot = Math.max(openY, closeY);
+            ctx.fillStyle = isUp ? 'rgba(63, 185, 80, 0.3)' : 'rgba(248, 81, 73, 0.3)';
+            ctx.fillRect(x, bodyTop, colW + 0.5, Math.max(bodyBot - bodyTop, 1));
+
+            // Volume bubble at close price
+            if (item.volume > 0) {
+                const volIntensity = Math.min(Math.sqrt(item.volume / volMax), 1.0);
+                const radius = Math.max(1.5, volIntensity * Math.min(colW * 2, 8));
+                const cy = priceToY(item.close) + rowH / 2;
+                const cx = x + colW / 2;
+                ctx.beginPath();
+                ctx.arc(cx, cy, radius, 0, Math.PI * 2);
+                ctx.fillStyle = isUp
+                    ? `rgba(63, 185, 80, ${0.3 + volIntensity * 0.5})`
+                    : `rgba(248, 81, 73, ${0.3 + volIntensity * 0.5})`;
+                ctx.fill();
+            }
+        }
+
+        // ===== PASS 2: Draw depth heatmap cells =====
+        for (let i = 0; i < visible.length; i++) {
+            const item = visible[i];
+            if (item.type !== 'depth') continue;
+            const x = padL + i * colW;
 
             // Bid levels (green)
-            for (const [price, qty] of f.bids) {
+            for (const [price, qty] of item.bids) {
                 if (qty <= 0) continue;
-                const row = Math.round((priceMax - price) / tickSize);
-                const y = padT + row * rowH;
+                const y = priceToY(price);
                 const intensity = Math.min(Math.log(1 + qty) / Math.log(1 + scaleMax), 1.0);
 
-                // Color gradient: dark green → bright green → white-green for walls
                 let r, g, b, a;
                 if (intensity > 0.85) {
-                    // Wall: bright white-green glow
                     const t = (intensity - 0.85) / 0.15;
                     r = Math.floor(150 + t * 105);
                     g = Math.floor(220 + t * 35);
@@ -1166,10 +1259,9 @@
             }
 
             // Ask levels (red)
-            for (const [price, qty] of f.asks) {
+            for (const [price, qty] of item.asks) {
                 if (qty <= 0) continue;
-                const row = Math.round((priceMax - price) / tickSize);
-                const y = padT + row * rowH;
+                const y = priceToY(price);
                 const intensity = Math.min(Math.log(1 + qty) / Math.log(1 + scaleMax), 1.0);
 
                 let r, g, b, a;
@@ -1190,39 +1282,61 @@
             }
         }
 
-        // --- Draw LTP line (yellow) ---
+        // ===== PASS 3: Draw LTP/close price line =====
         ctx.strokeStyle = 'rgba(210, 153, 34, 0.95)';
-        ctx.lineWidth = Math.max(1.5, rowH * 0.4);
+        ctx.lineWidth = Math.max(1.5, rowH * 0.3);
         ctx.lineCap = 'round';
         ctx.lineJoin = 'round';
         ctx.beginPath();
         let started = false;
-        for (let fi = 0; fi < visibleFrames.length; fi++) {
-            const f = visibleFrames[fi];
-            const x = padL + fi * colW + colW / 2;
-            const row = (priceMax - f.ltp) / tickSize;
-            const y = padT + row * rowH + rowH / 2;
+        for (let i = 0; i < visible.length; i++) {
+            const item = visible[i];
+            const x = padL + i * colW + colW / 2;
+            const y = priceToY(item.ltp) + rowH / 2;
             if (!started) { ctx.moveTo(x, y); started = true; }
             else ctx.lineTo(x, y);
         }
         ctx.stroke();
 
-        // Current price marker (right edge)
-        const lastFrame = visibleFrames[visibleFrames.length - 1];
-        const lastRow = (priceMax - lastFrame.ltp) / tickSize;
-        const lastY = padT + lastRow * rowH + rowH / 2;
+        // ===== PASS 4: Day separator lines =====
+        let lastDate = '';
+        ctx.strokeStyle = 'rgba(88, 166, 255, 0.3)';
+        ctx.lineWidth = 1;
+        ctx.setLineDash([4, 4]);
+        for (let i = 0; i < visible.length; i++) {
+            const d = new Date(visible[i].ts * 1000);
+            const dateStr = d.toLocaleDateString();
+            if (dateStr !== lastDate && lastDate !== '') {
+                const x = padL + i * colW;
+                ctx.beginPath();
+                ctx.moveTo(x, padT);
+                ctx.lineTo(x, padT + chartH);
+                ctx.stroke();
+                // Date label
+                ctx.fillStyle = 'rgba(88, 166, 255, 0.6)';
+                ctx.font = '9px monospace';
+                ctx.textAlign = 'left';
+                ctx.fillText(d.toLocaleDateString([], { month: 'short', day: 'numeric' }), x + 3, padT + 12);
+            }
+            lastDate = dateStr;
+        }
+        ctx.setLineDash([]);
+
+        // ===== Current price marker (right edge) =====
+        const lastItem = visible[visible.length - 1];
+        const lastY = priceToY(lastItem.ltp) + rowH / 2;
         ctx.fillStyle = 'rgba(210, 153, 34, 1)';
         ctx.beginPath();
         ctx.arc(padL + chartW, lastY, 4, 0, Math.PI * 2);
         ctx.fill();
 
-        // Current price label
+        // Price tag on right
         ctx.fillStyle = '#d29922';
         ctx.font = 'bold 11px monospace';
-        ctx.textAlign = 'left';
-        ctx.fillText(lastFrame.ltp.toFixed(2), padL + chartW - 55, lastY - 6);
+        ctx.textAlign = 'right';
+        ctx.fillText(lastItem.ltp.toFixed(2), padL + chartW - 4, lastY - 6);
 
-        // --- Price labels on Y axis ---
+        // ===== Price labels on Y axis =====
         ctx.fillStyle = '#8b949e';
         ctx.font = '10px monospace';
         ctx.textAlign = 'right';
@@ -1232,7 +1346,6 @@
             const y = padT + i * rowH + rowH / 2;
             ctx.fillText(price.toFixed(2), padL - 4, y + 3);
 
-            // Subtle grid line
             ctx.strokeStyle = 'rgba(48, 54, 61, 0.25)';
             ctx.lineWidth = 0.5;
             ctx.beginPath();
@@ -1241,18 +1354,18 @@
             ctx.stroke();
         }
 
-        // --- Time labels on X axis ---
-        const timeStep = Math.max(1, Math.floor(visibleFrames.length / 8));
+        // ===== Time labels on X axis =====
+        const timeStep = Math.max(1, Math.floor(visible.length / 8));
         ctx.fillStyle = '#8b949e';
         ctx.font = '9px monospace';
         ctx.textAlign = 'center';
-        for (let fi = 0; fi < visibleFrames.length; fi += timeStep) {
-            const f = visibleFrames[fi];
-            const x = padL + fi * colW;
-            const t = new Date(f.ts * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
-            ctx.fillText(t, x, H - 5);
+        for (let i = 0; i < visible.length; i += timeStep) {
+            const item = visible[i];
+            const x = padL + i * colW;
+            const d = new Date(item.ts * 1000);
+            const label = d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+            ctx.fillText(label, x, H - 5);
 
-            // Vertical grid line
             ctx.strokeStyle = 'rgba(48, 54, 61, 0.2)';
             ctx.lineWidth = 0.5;
             ctx.beginPath();
@@ -1261,20 +1374,28 @@
             ctx.stroke();
         }
 
-        // --- Chart border ---
+        // ===== Chart border =====
         ctx.strokeStyle = '#30363d';
         ctx.lineWidth = 1;
         ctx.strokeRect(padL, padT, chartW, chartH);
 
-        // Update info
+        // ===== Info footer =====
         const infoEl = document.getElementById('bookmapInfo');
         if (infoEl) {
-            const firstTs = visibleFrames[0].ts;
-            const lastTs = visibleFrames[visibleFrames.length - 1].ts;
-            const duration = Math.round(lastTs - firstTs);
-            const mins = Math.floor(duration / 60);
-            const secs = duration % 60;
-            infoEl.textContent = `${frames.length} total frames | Visible: ${visibleFrames.length} | Span: ${mins}m ${secs}s`;
+            const nCandles = visible.filter(v => v.type === 'candle').length;
+            const nDepth = visible.filter(v => v.type === 'depth').length;
+            const firstTs = visible[0].ts;
+            const lastTs = visible[visible.length - 1].ts;
+            const span = lastTs - firstTs;
+            const hours = Math.floor(span / 3600);
+            const mins = Math.floor((span % 3600) / 60);
+            const totalItems = allItems.length;
+            let spanStr = hours > 0 ? `${hours}h ${mins}m` : `${mins}m`;
+            if (hours >= 24) {
+                const days = Math.floor(hours / 24);
+                spanStr = `${days}d ${hours % 24}h`;
+            }
+            infoEl.textContent = `${totalItems} total | ${nCandles} candles + ${nDepth} depth frames visible | Span: ${spanStr}`;
         }
     }
 
