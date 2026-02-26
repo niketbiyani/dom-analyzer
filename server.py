@@ -20,12 +20,14 @@ from fastapi.staticfiles import StaticFiles
 from config import REFRESH_INTERVAL_MS, PORT, FYERS_SYMBOL, DHAN_SECURITY_ID, DHAN_ACCESS_TOKEN
 from analytics import DOMAnalytics
 from depth_ws import DepthWebSocket
+from storage import Storage
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", datefmt="%H:%M:%S")
 logger = logging.getLogger(__name__)
 
 # Global state
 analytics = DOMAnalytics()
+storage = Storage()
 clients: set[WebSocket] = set()
 depth_ws = DepthWebSocket()
 demo_mode = False
@@ -42,12 +44,38 @@ async def broadcast(data: dict):
     clients.difference_update(dead)
 
 
+def _persist_after_snapshot(snapshot):
+    """Buffer latest snapshot data for persistence."""
+    latest_tick = None
+    if analytics.tick_volumes:
+        tv = analytics.tick_volumes[-1]
+        latest_tick = {
+            "timestamp": tv.timestamp, "price": tv.price,
+            "buy_volume": tv.buy_volume, "sell_volume": tv.sell_volume, "delta": tv.delta,
+        }
+
+    latest_delta = None
+    if analytics.delta_history:
+        latest_delta = analytics.delta_history[-1]
+
+    new_events = []
+    for ev in list(analytics.pull_stack_events)[-5:]:
+        new_events.append({
+            "timestamp": ev.timestamp, "event_type": ev.event_type,
+            "side": ev.side, "price": ev.price,
+            "qty_change": ev.qty_change, "old_qty": ev.old_qty, "new_qty": ev.new_qty,
+        })
+
+    storage.buffer_snapshot(snapshot, tick_volume=latest_tick, cum_delta=latest_delta, events=new_events)
+
+
 async def on_depth_update(snapshot: dict):
     """Called by DepthWebSocket when new depth data arrives."""
     if not snapshot or not snapshot.get("bids"):
         return
 
     analytics.process_snapshot(snapshot)
+    _persist_after_snapshot(snapshot)
 
     payload = {
         "type": "dom_update",
@@ -106,6 +134,7 @@ async def demo_poll():
         try:
             snapshot = generate_demo_snapshot()
             analytics.process_snapshot(snapshot)
+            _persist_after_snapshot(snapshot)
             payload = {
                 "type": "dom_update",
                 "snapshot": snapshot,
@@ -118,23 +147,77 @@ async def demo_poll():
         await asyncio.sleep(interval)
 
 
+async def storage_flush_loop():
+    """Periodically flush buffered data to SQLite."""
+    while True:
+        await asyncio.sleep(5)
+        try:
+            await asyncio.to_thread(storage.flush)
+        except Exception as e:
+            logger.error("[Server] Storage flush error: %s", e)
+
+
+async def storage_cleanup_loop():
+    """Remove data older than 24 hours, runs every hour."""
+    while True:
+        await asyncio.sleep(3600)
+        try:
+            await asyncio.to_thread(storage.cleanup, 24)
+        except Exception as e:
+            logger.error("[Server] Storage cleanup error: %s", e)
+
+
+def restore_from_storage():
+    """Restore analytics state from SQLite on startup."""
+    try:
+        delta_hist = storage.load_delta_history(limit=5000)
+        tick_vols = storage.load_tick_volumes(limit=5000)
+        cum_delta = storage.get_last_cumulative_delta()
+
+        if delta_hist or tick_vols:
+            analytics.restore(cum_delta, tick_vols, delta_hist)
+            logger.info(
+                "[Server] Restored %d tick volumes, %d delta points, cumulative_delta=%d",
+                len(tick_vols), len(delta_hist), cum_delta,
+            )
+        else:
+            logger.info("[Server] No historical data to restore")
+    except Exception as e:
+        logger.error("[Server] Restore error: %s", e)
+
+
 @asynccontextmanager
 async def lifespan(app):
     """Start depth feed on server startup."""
     global demo_mode
 
+    # Restore accumulated data from SQLite
+    restore_from_storage()
+
+    # Start storage flush task
+    flush_task = asyncio.create_task(storage_flush_loop())
+    cleanup_task = asyncio.create_task(storage_cleanup_loop())
+
     if not DHAN_ACCESS_TOKEN:
         demo_mode = True
         logger.info("[Server] No DHAN_ACCESS_TOKEN — running in DEMO mode")
-        task = asyncio.create_task(demo_poll())
+        feed_task = asyncio.create_task(demo_poll())
     else:
         logger.info("[Server] Starting 20-level depth WebSocket feed...")
         depth_ws.on_update(on_depth_update)
-        task = asyncio.create_task(depth_ws.run())
+        feed_task = asyncio.create_task(depth_ws.run())
 
     yield
 
-    task.cancel()
+    feed_task.cancel()
+    flush_task.cancel()
+    cleanup_task.cancel()
+
+    # Final flush before shutdown
+    try:
+        storage.flush()
+    except Exception:
+        pass
 
 
 app = FastAPI(title="DOM Analyzer", lifespan=lifespan)
@@ -165,6 +248,20 @@ async def get_config():
 async def websocket_endpoint(ws: WebSocket):
     await ws.accept()
     clients.add(ws)
+
+    # Send historical data on connect so client has full picture
+    try:
+        history = {
+            "type": "history",
+            "bookmap_frames": await asyncio.to_thread(storage.load_bookmap_frames, 3000),
+            "tick_volumes": await asyncio.to_thread(storage.load_tick_volumes, 2000),
+            "delta_history": await asyncio.to_thread(storage.load_delta_history, 2000),
+            "cumulative_delta": analytics.cumulative_delta,
+        }
+        await ws.send_json(history)
+    except Exception as e:
+        logger.error("[Server] Error sending history: %s", e)
+
     try:
         while True:
             data = await ws.receive_text()

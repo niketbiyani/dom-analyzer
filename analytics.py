@@ -68,7 +68,7 @@ class TickVolume:
 class DOMAnalytics:
     """Main analytics engine that processes DOM snapshots over time."""
 
-    def __init__(self, wall_threshold: float = WALL_THRESHOLD, max_history: int = 500):
+    def __init__(self, wall_threshold: float = WALL_THRESHOLD, max_history: int = 5000):
         self.wall_threshold = wall_threshold
         self.max_history = max_history
 
@@ -436,7 +436,7 @@ class DOMAnalytics:
     def get_cumulative_delta(self) -> dict:
         return {
             "current": self.cumulative_delta,
-            "history": list(self.delta_history)[-100:],
+            "history": list(self.delta_history)[-500:],
         }
 
     def get_tick_volumes(self) -> list:
@@ -448,7 +448,7 @@ class DOMAnalytics:
                 "sell_volume": t.sell_volume,
                 "delta": t.delta,
             }
-            for t in list(self.tick_volumes)[-200:]
+            for t in list(self.tick_volumes)[-500:]
         ]
 
     def get_full_state(self, snapshot: Optional[dict] = None) -> dict:
@@ -460,3 +460,17 @@ class DOMAnalytics:
             "cumulative_delta": self.get_cumulative_delta(),
             "tick_volumes": self.get_tick_volumes(),
         }
+
+    def restore(self, cumulative_delta: int, tick_volumes: list, delta_history: list):
+        """Restore state from persistent storage after server restart."""
+        self.cumulative_delta = cumulative_delta
+        for tv in tick_volumes:
+            self.tick_volumes.append(TickVolume(
+                timestamp=tv["timestamp"],
+                price=tv["price"],
+                buy_volume=tv["buy_volume"],
+                sell_volume=tv["sell_volume"],
+                delta=tv["delta"],
+            ))
+        for dh in delta_history:
+            self.delta_history.append(dh)
