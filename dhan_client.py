@@ -41,7 +41,7 @@ def generate_totp():
 
 def fetch_market_depth():
     """
-    Fetch 20-level market depth for the configured Nifty future.
+    Fetch market depth for the configured Nifty future.
 
     Returns dict with:
         - bids: list of {price, quantity, orders} sorted by price descending
@@ -49,81 +49,61 @@ def fetch_market_depth():
         - ltp: last traded price
         - timestamp: server timestamp
     """
-    url = f"{BASE_URL}/marketfeed/depth"
+    url = f"{BASE_URL}/marketfeed/quote"
+    segment = EXCHANGE_MAP.get(DHAN_EXCHANGE_SEGMENT, DHAN_EXCHANGE_SEGMENT)
 
     payload = {
-        "securityId": str(DHAN_SECURITY_ID),
-        "exchangeSegment": EXCHANGE_MAP.get(DHAN_EXCHANGE_SEGMENT, DHAN_EXCHANGE_SEGMENT),
+        segment: [DHAN_SECURITY_ID],
     }
 
     try:
         resp = httpx.post(url, json=payload, headers=get_headers(), timeout=5.0)
         resp.raise_for_status()
         data = resp.json()
-        return _parse_depth(data)
-    except httpx.HTTPStatusError as e:
-        # Fall back to depth endpoint via GET
-        return _fetch_depth_fallback()
+        return _parse_depth(data, segment)
     except Exception as e:
         print(f"[DhanClient] Error fetching depth: {e}")
         return None
 
 
-def _fetch_depth_fallback():
-    """Fallback: use the quotes endpoint which includes 5-level depth."""
-    url = f"{BASE_URL}/marketfeed/quote"
+def _parse_depth(data, segment="NSE_FNO"):
+    """Parse Dhan v2 depth response into normalized format.
 
-    payload = {
-        "securityId": str(DHAN_SECURITY_ID),
-        "exchangeSegment": EXCHANGE_MAP.get(DHAN_EXCHANGE_SEGMENT, DHAN_EXCHANGE_SEGMENT),
-    }
-
-    try:
-        resp = httpx.post(url, json=payload, headers=get_headers(), timeout=5.0)
-        resp.raise_for_status()
-        data = resp.json()
-        return _parse_depth(data)
-    except Exception as e:
-        print(f"[DhanClient] Fallback error: {e}")
-        return None
-
-
-def _parse_depth(data):
-    """Parse Dhan depth response into normalized format."""
+    Response structure: {"data":{"NSE_FNO":{"51714":{...}}},"status":"success"}
+    """
     bids = []
     asks = []
     ltp = 0.0
 
-    # Dhan v2 depth response structure
-    if "data" in data:
-        d = data["data"]
-    else:
-        d = data
+    # Navigate: data -> segment -> security_id -> instrument data
+    root = data.get("data", {})
+    seg_data = root.get(segment, {})
 
-    ltp = float(d.get("last_price", 0) or d.get("LTP", 0) or d.get("ltp", 0) or 0)
+    # Get the first (only) instrument in the response
+    sec_id = str(DHAN_SECURITY_ID)
+    d = seg_data.get(sec_id, {})
 
-    # Parse depth levels - Dhan provides depth as arrays
-    depth = d.get("depth", d)
+    if not d:
+        return None
 
-    # Handle buy side
-    buy_data = depth.get("buy", [])
-    if isinstance(buy_data, list):
-        for level in buy_data:
-            price = float(level.get("price", 0))
-            qty = int(level.get("quantity", 0))
-            orders = int(level.get("orders", 0))
-            if price > 0:
-                bids.append({"price": price, "quantity": qty, "orders": orders})
+    ltp = float(d.get("last_price", 0))
 
-    # Handle sell side
-    sell_data = depth.get("sell", [])
-    if isinstance(sell_data, list):
-        for level in sell_data:
-            price = float(level.get("price", 0))
-            qty = int(level.get("quantity", 0))
-            orders = int(level.get("orders", 0))
-            if price > 0:
-                asks.append({"price": price, "quantity": qty, "orders": orders})
+    # Parse depth levels
+    depth = d.get("depth", {})
+
+    for level in depth.get("buy", []):
+        price = float(level.get("price", 0))
+        qty = int(level.get("quantity", 0))
+        orders = int(level.get("orders", 0))
+        if price > 0:
+            bids.append({"price": price, "quantity": qty, "orders": orders})
+
+    for level in depth.get("sell", []):
+        price = float(level.get("price", 0))
+        qty = int(level.get("quantity", 0))
+        orders = int(level.get("orders", 0))
+        if price > 0:
+            asks.append({"price": price, "quantity": qty, "orders": orders})
 
     # Sort: bids descending, asks ascending
     bids.sort(key=lambda x: x["price"], reverse=True)
@@ -140,16 +120,17 @@ def _parse_depth(data):
 def fetch_last_traded_price():
     """Fetch just the LTP for the configured instrument."""
     url = f"{BASE_URL}/marketfeed/ltp"
+    segment = EXCHANGE_MAP.get(DHAN_EXCHANGE_SEGMENT, DHAN_EXCHANGE_SEGMENT)
     payload = {
-        "securityId": str(DHAN_SECURITY_ID),
-        "exchangeSegment": EXCHANGE_MAP.get(DHAN_EXCHANGE_SEGMENT, DHAN_EXCHANGE_SEGMENT),
+        segment: [DHAN_SECURITY_ID],
     }
     try:
         resp = httpx.post(url, json=payload, headers=get_headers(), timeout=5.0)
         resp.raise_for_status()
         data = resp.json()
-        d = data.get("data", data)
-        return float(d.get("last_price", 0) or d.get("LTP", 0) or d.get("ltp", 0) or 0)
+        seg_data = data.get("data", {}).get(segment, {})
+        d = seg_data.get(str(DHAN_SECURITY_ID), {})
+        return float(d.get("last_price", 0))
     except Exception as e:
         print(f"[DhanClient] LTP error: {e}")
         return 0.0
