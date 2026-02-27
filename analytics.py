@@ -3,8 +3,9 @@ DOM Analytics Engine
 
 Tracks order book over time and computes:
 - Wall detection (support/resistance)
-- Absorption alerts
-- Pulling/stacking detection
+- Absorption alerts (with cooldown)
+- Pulling/stacking detection (with cooldown and higher thresholds)
+- Key levels — accumulated support/resistance from wall persistence
 - Cumulative delta
 - Tick-wise buyer/seller volume
 """
@@ -14,7 +15,10 @@ from collections import deque
 from dataclasses import dataclass, field
 from typing import Optional
 
-from config import WALL_THRESHOLD, ABSORPTION_TICKS
+from config import (
+    WALL_THRESHOLD, ABSORPTION_TICKS,
+    PULL_STACK_THRESHOLD, ALERT_COOLDOWN_SECONDS, KEY_LEVEL_DECAY_SECONDS,
+)
 
 
 @dataclass
@@ -65,6 +69,22 @@ class TickVolume:
     delta: int  # buy - sell
 
 
+@dataclass
+class KeyLevel:
+    """Accumulated support/resistance level from persistent wall activity."""
+    price: float
+    side: str  # "support" or "resistance"
+    strength: float  # accumulated score (higher = stronger)
+    total_wall_seconds: float  # how long walls have sat here
+    total_qty_seen: int  # cumulative qty across all wall appearances
+    appearances: int  # how many distinct wall appearances
+    peak_qty: int  # largest single qty seen
+    peak_ratio: float  # largest ratio seen
+    first_seen: float
+    last_seen: float
+    active: bool  # is there currently a wall here?
+
+
 class DOMAnalytics:
     """Main analytics engine that processes DOM snapshots over time."""
 
@@ -88,6 +108,12 @@ class DOMAnalytics:
         # Recent pull/stack events (keep last 50)
         self.pull_stack_events = deque(maxlen=50)
 
+        # Alert cooldown: (alert_type, side, price) -> last_alert_timestamp
+        self._alert_cooldowns: dict[tuple, float] = {}
+
+        # Key levels: price -> KeyLevel (accumulated S/R from wall activity)
+        self.key_levels: dict[float, KeyLevel] = {}
+
         # Cumulative delta tracking
         self.cumulative_delta = 0
         self.delta_history = deque(maxlen=max_history)  # [(timestamp, cum_delta)]
@@ -99,6 +125,15 @@ class DOMAnalytics:
         self._prev_bids = {}  # price -> qty
         self._prev_asks = {}  # price -> qty
         self._prev_ltp = 0.0
+
+    def _is_cooled_down(self, alert_type: str, side: str, price: float, ts: float) -> bool:
+        """Check if enough time has passed since last alert for this key."""
+        key = (alert_type, side, price)
+        last = self._alert_cooldowns.get(key, 0)
+        if ts - last >= ALERT_COOLDOWN_SECONDS:
+            self._alert_cooldowns[key] = ts
+            return True
+        return False
 
     def process_snapshot(self, snapshot: dict):
         """
@@ -124,6 +159,9 @@ class DOMAnalytics:
 
         # --- Wall Detection ---
         self._detect_walls(bids, asks, ts)
+
+        # --- Key Levels Update ---
+        self._update_key_levels(ts)
 
         # --- Absorption Detection ---
         self._detect_absorption(curr_bids, curr_asks, ts)
@@ -216,10 +254,90 @@ class DOMAnalytics:
         for p in stale:
             del self.ask_walls[p]
 
+    def _update_key_levels(self, ts: float):
+        """
+        Accumulate wall presence into key levels (support/resistance).
+
+        Each tick a wall exists, its key level gains strength.
+        Levels decay over time when walls are absent.
+        """
+        # Mark all current key levels as inactive initially
+        for kl in self.key_levels.values():
+            kl.active = False
+
+        # Accumulate from current bid walls -> support levels
+        for price, wall in self.bid_walls.items():
+            duration = ts - wall.first_seen
+            if price in self.key_levels:
+                kl = self.key_levels[price]
+                kl.strength += wall.ratio * 0.1  # increment per tick
+                kl.total_wall_seconds = duration + (kl.first_seen - wall.first_seen if kl.first_seen > wall.first_seen else 0)
+                kl.total_qty_seen += wall.quantity
+                kl.peak_qty = max(kl.peak_qty, wall.quantity)
+                kl.peak_ratio = max(kl.peak_ratio, wall.ratio)
+                kl.last_seen = ts
+                kl.active = True
+            else:
+                self.key_levels[price] = KeyLevel(
+                    price=price,
+                    side="support",
+                    strength=wall.ratio,
+                    total_wall_seconds=duration,
+                    total_qty_seen=wall.quantity,
+                    appearances=1,
+                    peak_qty=wall.quantity,
+                    peak_ratio=wall.ratio,
+                    first_seen=wall.first_seen,
+                    last_seen=ts,
+                    active=True,
+                )
+
+        # Accumulate from current ask walls -> resistance levels
+        for price, wall in self.ask_walls.items():
+            duration = ts - wall.first_seen
+            if price in self.key_levels:
+                kl = self.key_levels[price]
+                kl.strength += wall.ratio * 0.1
+                kl.total_wall_seconds = duration + (kl.first_seen - wall.first_seen if kl.first_seen > wall.first_seen else 0)
+                kl.total_qty_seen += wall.quantity
+                kl.peak_qty = max(kl.peak_qty, wall.quantity)
+                kl.peak_ratio = max(kl.peak_ratio, wall.ratio)
+                kl.last_seen = ts
+                kl.active = True
+            else:
+                self.key_levels[price] = KeyLevel(
+                    price=price,
+                    side="resistance",
+                    strength=wall.ratio,
+                    total_wall_seconds=duration,
+                    total_qty_seen=wall.quantity,
+                    appearances=1,
+                    peak_qty=wall.quantity,
+                    peak_ratio=wall.ratio,
+                    first_seen=wall.first_seen,
+                    last_seen=ts,
+                    active=True,
+                )
+
+        # Decay and prune inactive key levels
+        expired = []
+        for price, kl in self.key_levels.items():
+            if not kl.active:
+                age_since_last = ts - kl.last_seen
+                # Decay strength over time when wall is gone
+                decay = age_since_last / KEY_LEVEL_DECAY_SECONDS
+                kl.strength = max(0, kl.strength - decay * 0.05)
+                # Remove if decayed completely or too old
+                if kl.strength <= 0.1 or age_since_last > KEY_LEVEL_DECAY_SECONDS:
+                    expired.append(price)
+        for p in expired:
+            del self.key_levels[p]
+
     def _detect_absorption(self, curr_bids: dict, curr_asks: dict, ts: float):
         """
         Detect absorption: wall being hit but holding vs draining.
         Only fires after tracking a wall for enough ticks.
+        Uses cooldown to prevent spam.
         """
         self.absorption_alerts = []
 
@@ -272,11 +390,14 @@ class DOMAnalytics:
                     ))
 
     def _detect_pull_stack(self, curr_bids: dict, curr_asks: dict, ts: float):
-        """Detect pulling (large orders disappearing) and stacking (large orders appearing)."""
+        """
+        Detect pulling (large orders disappearing) and stacking (large orders appearing).
+        Uses higher threshold (PULL_STACK_THRESHOLD) and cooldown to reduce noise.
+        """
         # Check bids
         all_bid_qtys = list(curr_bids.values()) + list(self._prev_bids.values())
         avg_bid = sum(all_bid_qtys) / len(all_bid_qtys) if all_bid_qtys else 1
-        threshold = avg_bid * 2  # Significant change threshold
+        threshold = avg_bid * PULL_STACK_THRESHOLD
 
         for price in set(list(curr_bids.keys()) + list(self._prev_bids.keys())):
             old_qty = self._prev_bids.get(price, 0)
@@ -284,25 +405,24 @@ class DOMAnalytics:
             change = new_qty - old_qty
 
             if abs(change) >= threshold:
-                if change > 0:
-                    event_type = "stacking"
-                else:
-                    event_type = "pulling"
+                event_type = "stacking" if change > 0 else "pulling"
 
-                self.pull_stack_events.append(PullStackEvent(
-                    price=price,
-                    side="bid",
-                    event_type=event_type,
-                    qty_change=change,
-                    old_qty=old_qty,
-                    new_qty=new_qty,
-                    timestamp=ts,
-                ))
+                # Check cooldown before adding
+                if self._is_cooled_down(event_type, "bid", price, ts):
+                    self.pull_stack_events.append(PullStackEvent(
+                        price=price,
+                        side="bid",
+                        event_type=event_type,
+                        qty_change=change,
+                        old_qty=old_qty,
+                        new_qty=new_qty,
+                        timestamp=ts,
+                    ))
 
         # Check asks
         all_ask_qtys = list(curr_asks.values()) + list(self._prev_asks.values())
         avg_ask = sum(all_ask_qtys) / len(all_ask_qtys) if all_ask_qtys else 1
-        threshold = avg_ask * 2
+        threshold = avg_ask * PULL_STACK_THRESHOLD
 
         for price in set(list(curr_asks.keys()) + list(self._prev_asks.keys())):
             old_qty = self._prev_asks.get(price, 0)
@@ -310,20 +430,18 @@ class DOMAnalytics:
             change = new_qty - old_qty
 
             if abs(change) >= threshold:
-                if change > 0:
-                    event_type = "stacking"
-                else:
-                    event_type = "pulling"
+                event_type = "stacking" if change > 0 else "pulling"
 
-                self.pull_stack_events.append(PullStackEvent(
-                    price=price,
-                    side="ask",
-                    event_type=event_type,
-                    qty_change=change,
-                    old_qty=old_qty,
-                    new_qty=new_qty,
-                    timestamp=ts,
-                ))
+                if self._is_cooled_down(event_type, "ask", price, ts):
+                    self.pull_stack_events.append(PullStackEvent(
+                        price=price,
+                        side="ask",
+                        event_type=event_type,
+                        qty_change=change,
+                        old_qty=old_qty,
+                        new_qty=new_qty,
+                        timestamp=ts,
+                    ))
 
     def _compute_tick_volume(self, curr_bids: dict, curr_asks: dict, ltp: float, ts: float):
         """
@@ -451,6 +569,27 @@ class DOMAnalytics:
             for t in list(self.tick_volumes)[-500:]
         ]
 
+    def get_key_levels(self) -> list:
+        """Get accumulated support/resistance key levels, sorted by strength."""
+        now = time.time()
+        levels = []
+        for kl in sorted(self.key_levels.values(), key=lambda x: x.strength, reverse=True):
+            # Only include levels with meaningful strength
+            if kl.strength < 0.5:
+                continue
+            levels.append({
+                "price": kl.price,
+                "side": kl.side,
+                "strength": round(kl.strength, 1),
+                "total_wall_seconds": round(kl.total_wall_seconds, 1),
+                "peak_qty": kl.peak_qty,
+                "peak_ratio": round(kl.peak_ratio, 2),
+                "appearances": kl.appearances,
+                "age_seconds": round(now - kl.first_seen, 1),
+                "active": kl.active,
+            })
+        return levels[:20]  # Top 20 key levels
+
     def get_full_state(self, snapshot: Optional[dict] = None) -> dict:
         """Get complete analytics state for the frontend."""
         return {
@@ -459,6 +598,7 @@ class DOMAnalytics:
             "pull_stack": self.get_pull_stack_events(),
             "cumulative_delta": self.get_cumulative_delta(),
             "tick_volumes": self.get_tick_volumes(),
+            "key_levels": self.get_key_levels(),
         }
 
     def restore(self, cumulative_delta: int, tick_volumes: list, delta_history: list):

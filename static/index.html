@@ -470,6 +470,71 @@
 
         .alert-message { flex: 1; }
 
+        /* Key Levels styling */
+        .key-level-item {
+            padding: 5px 6px;
+            margin-bottom: 3px;
+            border-radius: 3px;
+            font-size: 11px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .key-level-item.support {
+            background: rgba(63, 185, 80, 0.1);
+            border-left: 3px solid var(--green);
+        }
+
+        .key-level-item.resistance {
+            background: rgba(248, 81, 73, 0.1);
+            border-left: 3px solid var(--red);
+        }
+
+        .key-level-item.active {
+            box-shadow: inset 0 0 8px rgba(210, 153, 34, 0.2);
+        }
+
+        .key-level-price {
+            font-weight: 700;
+        }
+
+        .key-level-strength {
+            display: flex;
+            align-items: center;
+            gap: 4px;
+        }
+
+        .strength-bar {
+            height: 4px;
+            border-radius: 2px;
+            min-width: 20px;
+            max-width: 60px;
+        }
+
+        .support .strength-bar { background: var(--green); }
+        .resistance .strength-bar { background: var(--red); }
+
+        .strength-label {
+            font-size: 10px;
+            color: var(--text-dim);
+        }
+
+        .key-level-meta {
+            font-size: 9px;
+            color: var(--text-dim);
+        }
+
+        .active-dot {
+            display: inline-block;
+            width: 5px;
+            height: 5px;
+            border-radius: 50%;
+            background: var(--yellow);
+            box-shadow: 0 0 4px var(--yellow);
+            margin-right: 3px;
+        }
+
         /* Scrollbar styling */
         ::-webkit-scrollbar { width: 6px; }
         ::-webkit-scrollbar-track { background: var(--bg-dark); }
@@ -548,6 +613,10 @@
                 <div class="panel-section">
                     <div class="panel-title">Recent Pull/Stack Events</div>
                     <div id="pullStackList"><span style="color:var(--text-dim);font-size:11px">No events yet</span></div>
+                </div>
+                <div class="panel-section">
+                    <div class="panel-title">Key Levels (Accumulated S/R)</div>
+                    <div id="keyLevelsList"><span style="color:var(--text-dim);font-size:11px">Building key levels...</span></div>
                 </div>
             </div>
         </div>
@@ -798,6 +867,7 @@
         renderWalls(analytics.walls);
         renderAbsorption(analytics.absorption);
         renderPullStack(analytics.pull_stack);
+        renderKeyLevels(analytics.key_levels || []);
 
         // Add bookmap frame
         const frame = {
@@ -1058,6 +1128,39 @@
                 <div class="event-item ${e.type}">
                     <span>${arrow} ${e.side.toUpperCase()} @ ${e.price.toFixed(2)}</span>
                     <span>${e.old_qty} → ${e.new_qty}</span>
+                </div>
+            `;
+        }).join('');
+    }
+
+    // --- Key Levels Rendering ---
+    function renderKeyLevels(levels) {
+        const el = document.getElementById('keyLevelsList');
+        if (!levels || levels.length === 0) {
+            el.innerHTML = '<span style="color:var(--text-dim);font-size:11px">Building key levels...</span>';
+            return;
+        }
+
+        // Find max strength for bar scaling
+        const maxStrength = Math.max(...levels.map(l => l.strength), 1);
+
+        el.innerHTML = levels.map(l => {
+            const barWidth = Math.max(20, Math.min(60, (l.strength / maxStrength) * 60));
+            const activeDot = l.active ? '<span class="active-dot"></span>' : '';
+            const ageStr = l.age_seconds < 60 ? `${Math.floor(l.age_seconds)}s`
+                : l.age_seconds < 3600 ? `${Math.floor(l.age_seconds / 60)}m`
+                : `${Math.floor(l.age_seconds / 3600)}h`;
+
+            return `
+                <div class="key-level-item ${l.side} ${l.active ? 'active' : ''}">
+                    <div>
+                        <span class="key-level-price">${activeDot}${l.price.toFixed(2)}</span>
+                        <div class="key-level-meta">${l.side.toUpperCase()} | ${l.peak_ratio}x peak | ${ageStr} ago</div>
+                    </div>
+                    <div class="key-level-strength">
+                        <div class="strength-bar" style="width:${barWidth}px"></div>
+                        <span class="strength-label">${l.strength}</span>
+                    </div>
                 </div>
             `;
         }).join('');
@@ -1546,27 +1649,39 @@
     }
 
     // --- Alerts Log ---
+    // Alert cooldown: key -> timestamp (ms) of last alert
+    const alertCooldowns = {};
+    const ALERT_COOLDOWN_MS = 30000; // 30 second cooldown per alert key
+    const MAX_ALERTS = 200; // Cap total alerts stored
+
+    function shouldAlert(key) {
+        const now = Date.now();
+        const lastTime = alertCooldowns[key] || 0;
+        if (now - lastTime < ALERT_COOLDOWN_MS) return false;
+        alertCooldowns[key] = now;
+        return true;
+    }
+
     function processAlerts(analytics) {
         const now = new Date().toLocaleTimeString();
 
-        // Absorption alerts
+        // Absorption alerts — only alert significant ones (ticks >= 15)
         for (const a of analytics.absorption) {
+            if (a.ticks_tracked < 15) continue; // Skip early/noisy alerts
             const key = `abs-${a.side}-${a.price}-${a.type}`;
-            if (!state.seenAlertKeys.has(key)) {
-                state.seenAlertKeys.add(key);
+            if (shouldAlert(key)) {
                 state.alertLog.push({
                     time: now,
                     type: a.type,
-                    message: `${a.side.toUpperCase()} wall @ ${a.price.toFixed(2)} is ${a.type === 'absorbing' ? 'ABSORBING (holding strong, ' : 'DRAINING (breaking down, '}${a.pct_remaining}% remaining)`,
+                    message: `${a.side.toUpperCase()} wall @ ${a.price.toFixed(2)} is ${a.type === 'absorbing' ? 'ABSORBING (holding strong, ' : 'DRAINING (breaking down, '}${a.pct_remaining}% remaining, ${a.ticks_tracked} ticks)`,
                 });
             }
         }
 
-        // Pull/stack events
+        // Pull/stack events — backend already applies cooldown, but also dedup on frontend
         for (const e of analytics.pull_stack) {
-            const key = `ps-${e.side}-${e.price}-${e.type}-${Math.floor(e.timestamp)}`;
-            if (!state.seenAlertKeys.has(key)) {
-                state.seenAlertKeys.add(key);
+            const key = `ps-${e.side}-${e.price}-${e.type}`;
+            if (shouldAlert(key)) {
                 state.alertLog.push({
                     time: now,
                     type: e.type,
@@ -1575,28 +1690,33 @@
             }
         }
 
-        // Wall detection
+        // Wall detection — only alert walls that persist (age > 3s) and are strong (ratio >= 4x)
         for (const w of analytics.walls.bid_walls) {
+            if (w.age_seconds < 3 || w.ratio < 4) continue;
             const key = `wall-bid-${w.price}`;
-            if (!state.seenAlertKeys.has(key)) {
-                state.seenAlertKeys.add(key);
+            if (shouldAlert(key)) {
                 state.alertLog.push({
                     time: now,
                     type: 'wall-bid',
-                    message: `BID WALL detected @ ${w.price.toFixed(2)} — ${w.quantity.toLocaleString()} qty (${w.ratio}x average) — potential SUPPORT`,
+                    message: `BID WALL @ ${w.price.toFixed(2)} — ${w.quantity.toLocaleString()} qty (${w.ratio}x avg) — potential SUPPORT (held ${w.age_seconds.toFixed(0)}s)`,
                 });
             }
         }
         for (const w of analytics.walls.ask_walls) {
+            if (w.age_seconds < 3 || w.ratio < 4) continue;
             const key = `wall-ask-${w.price}`;
-            if (!state.seenAlertKeys.has(key)) {
-                state.seenAlertKeys.add(key);
+            if (shouldAlert(key)) {
                 state.alertLog.push({
                     time: now,
                     type: 'wall-ask',
-                    message: `ASK WALL detected @ ${w.price.toFixed(2)} — ${w.quantity.toLocaleString()} qty (${w.ratio}x average) — potential RESISTANCE`,
+                    message: `ASK WALL @ ${w.price.toFixed(2)} — ${w.quantity.toLocaleString()} qty (${w.ratio}x avg) — potential RESISTANCE (held ${w.age_seconds.toFixed(0)}s)`,
                 });
             }
+        }
+
+        // Trim old alerts
+        if (state.alertLog.length > MAX_ALERTS) {
+            state.alertLog = state.alertLog.slice(-MAX_ALERTS);
         }
 
         // Update badge
